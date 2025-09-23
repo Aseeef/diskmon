@@ -128,19 +128,23 @@ class DeviceState:
 @dataclass
 class SMARTData:
     """Parsed SMART data from smartctl"""
+    device_type: Optional[str] = None
     smart_status_passed: bool = True
     temperature: Optional[int] = None
     power_on_hours: Optional[int] = None
     attributes: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     self_tests: List[Dict[str, Any]] = field(default_factory=list)
-    
+
+    # Store the raw NVMe log for direct evaluation
+    nvme_health_log: Optional[Dict[str, Any]] = None
+
     def get_attribute_raw_value(self, attr_id: int) -> int:
-        """Get raw value of a SMART attribute"""
+        """Get raw value of a SMART attribute (for ATA devices)"""
         attr = self.attributes.get(attr_id, {})
         return attr.get('raw', {}).get('value', 0)
-    
+
     def get_latest_self_test(self) -> Optional[Dict[str, Any]]:
-        """Get most recent self-test result"""
+        """Get most recent self-test result (for ATA devices)"""
         return self.self_tests[0] if self.self_tests else None
 
 
@@ -495,52 +499,37 @@ class SMARTHandler:
     def get_data(self, device_path: str) -> Tuple[SmartStatus, Optional[SMARTData]]:
         """Get SMART data and return a status indicating the outcome."""
         try:
-            # Run a lightweight check first
-            lightweight_check = self._run_smartctl(['-n', 'standby', '-j', '-H', device_path], timeout=30)
-            
-            if lightweight_check.returncode == 2:
-                return (SmartStatus.SLEEPING, None)
-
-            # If the command failed for any reason other than sleeping, try to parse its output anyway.
-            # This allows us to handle the "checksum" and "test in progress" cases.
-            if not lightweight_check.stdout:
-                # If there's no output at all, it's a hard failure.
-                logging.error(f"smartctl lightweight check failed with no output. stderr: {lightweight_check.stderr}")
-                return (SmartStatus.FAILED, None)
-            
-            try:
-                lightweight_data = json.loads(lightweight_check.stdout)
-                
-                # Check if a self-test is in progress
-                if "in progress" in lightweight_data.get("self_test_status", {}).get("string", "").lower():
-                    logging.info(f"SMART self-test is in progress. Performing a best-effort check.")
-                    # Parse what we can from the lightweight data and return it for a partial check.
-                    parsed_data = self._parse_json(lightweight_check.stdout)
-                    return (SmartStatus.TEST_IN_PROGRESS, parsed_data)
-
-            except json.JSONDecodeError:
-                logging.warning("Could not parse lightweight smartctl JSON.")
-                # Fall through to attempt the full check
-
-            # If we are here, the disk is not sleeping and no test is in progress. Proceed with full check.
+            # A single, comprehensive call is cleaner and more efficient.
             result = self._run_smartctl(['-j', '-a', device_path], timeout=60)
-            is_command_error = (result.returncode & 7) != 0
 
-            if is_command_error:
+            # Check for sleeping device first (returncode 2).
+            if result.returncode == 2:
+                return SmartStatus.SLEEPING, None
+
+            # Check for critical command failures (bitmask: 1=open fail, 2=cmd fail).
+            if (result.returncode & 3) != 0:
                 logging.error(f"smartctl command failed with critical error code {result.returncode}: {result.stderr}")
-                return (SmartStatus.FAILED, None)
-            
+                return SmartStatus.FAILED, None
+
+            # Non-critical errors (like checksum warnings) can proceed.
             if "invalid SMART checksum" in result.stderr:
                 logging.warning("Proceeding with SMART data parsing despite checksum warning.")
 
             parsed_data = self._parse_json(result.stdout)
-            if parsed_data is None: return (SmartStatus.FAILED, None)
-            
-            return (SmartStatus.SUCCESS, parsed_data)
-            
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            if parsed_data is None:
+                return SmartStatus.FAILED, None
+
+            # Now, determine the status from the complete data. This check is primarily for ATA drives.
+            data_dict = json.loads(result.stdout)
+            if "in progress" in data_dict.get("self_test_status", {}).get("string", "").lower():
+                 logging.info(f"SMART self-test is in progress.")
+                 return SmartStatus.TEST_IN_PROGRESS, parsed_data
+
+            return SmartStatus.SUCCESS, parsed_data
+
+        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError) as e:
             logging.error(f"SMART data collection failed: {e}")
-            return (SmartStatus.FAILED, None)
+            return SmartStatus.FAILED, None
     
     def _run_smartctl(self, args: List[str], timeout: int) -> subprocess.CompletedProcess:
         """Run smartctl command"""
@@ -553,55 +542,111 @@ class SMARTHandler:
         )
     
     def _parse_json(self, json_str: str) -> Optional[SMARTData]:
-        """Parse smartctl JSON output"""
+        """Parse smartctl JSON output, supporting both ATA and NVMe devices."""
         try:
             data = json.loads(json_str)
             smart_data = SMARTData()
-            
-            # Overall status
+
+            # --- Common Fields ---
             smart_data.smart_status_passed = data.get('smart_status', {}).get('passed', False)
-            
-            # Temperature
+            smart_data.device_type = data.get('device', {}).get('type')
+
+            # Use top-level temperature and power_on_time as they are more consistent
             smart_data.temperature = data.get('temperature', {}).get('current')
-            
-            # Power on hours
             smart_data.power_on_hours = data.get('power_on_time', {}).get('hours')
-            
-            # Attributes
-            for attr in data.get('ata_smart_attributes', {}).get('table', []):
-                if 'id' in attr:
-                    smart_data.attributes[attr['id']] = attr
-            
-            # Self-test log
-            log_data = data.get('ata_smart_self_test_log', {})
-            smart_data.self_tests = log_data.get('standard', {}).get('table', [])
-            
+
+            # --- Device-Specific Parsing ---
+            if smart_data.device_type == 'nvme':
+                # For NVMe, the most important data is in the health information log
+                smart_data.nvme_health_log = data.get('nvme_smart_health_information_log')
+
+                # If top-level temp wasn't found, try inside the log (fallback)
+                if smart_data.temperature is None and smart_data.nvme_health_log:
+                    smart_data.temperature = smart_data.nvme_health_log.get('temperature')
+
+            else: # Default to ATA/SATA parsing
+                smart_data.device_type = 'ata' # Be explicit for clarity
+                # Attributes
+                for attr in data.get('ata_smart_attributes', {}).get('table', []):
+                    if 'id' in attr:
+                        smart_data.attributes[attr['id']] = attr
+
+                # Self-test log (only relevant for ATA)
+                log_data = data.get('ata_smart_self_test_log', {})
+                smart_data.self_tests = log_data.get('standard', {}).get('table', [])
+
             return smart_data
-            
+
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse SMART JSON: {e}")
             return None
-    
+
     def evaluate(self, data: SMARTData, config: DiskmonConfig, is_test_in_progress: bool = False) -> Tuple[bool, List[str]]:
-        """Evaluate SMART data against thresholds"""
+        """Evaluate SMART data against thresholds based on device type."""
+        if data.device_type == 'nvme':
+            return self._evaluate_nvme(data, config)
+        else: # Default to ATA
+            return self._evaluate_ata(data, config, is_test_in_progress)
+
+    def _evaluate_nvme(self, data: SMARTData, config: DiskmonConfig) -> Tuple[bool, List[str]]:
+        """Evaluate NVMe SMART data against thresholds."""
         issues = []
-        
+
+        # 1. Overall health status
+        if not data.smart_status_passed:
+            issues.append("SMART overall health: FAILED")
+
+        # 2. Temperature
+        if data.temperature and data.temperature > config.temp_threshold:
+            issues.append(f"Temperature: {data.temperature}°C > {config.temp_threshold}°C")
+
+        log = data.nvme_health_log
+        if not log:
+            # This check is crucial; if the log is missing, we can't proceed.
+            if not issues: # Only add this if no other issue was found
+                 issues.append("NVMe SMART health log not found in smartctl output")
+            return False, issues
+
+        # 3. Critical Warning Flags (Bitmap)
+        critical_warning = log.get('critical_warning', 0)
+        if critical_warning > 0:
+            warnings = []
+            if critical_warning & 0x1: warnings.append("Available spare is below threshold")
+            if critical_warning & 0x2: warnings.append("Temperature has exceeded threshold")
+            if critical_warning & 0x4: warnings.append("NVM subsystem reliability is degraded")
+            if critical_warning & 0x8: warnings.append("Media is in read-only mode")
+            if critical_warning & 0x10: warnings.append("Volatile memory backup device has failed")
+            issues.append(f"Critical Warning flags set: {', '.join(warnings) or 'Unknown'}")
+
+        # 4. Media and Data Integrity Errors (maps to your 'uncorrectable' threshold)
+        media_errors = log.get('media_errors', 0)
+        threshold = config.smart_thresholds.get('uncorrectable', 0)
+        if media_errors > threshold:
+            issues.append(f"Media Errors: {media_errors} > {threshold}")
+
+        # Note: NVMe self-tests are not checked as they are often unsupported or logged differently.
+        return len(issues) == 0, issues
+
+    def _evaluate_ata(self, data: SMARTData, config: DiskmonConfig, is_test_in_progress: bool) -> Tuple[bool, List[str]]:
+        """Evaluate ATA SMART data against thresholds (original logic)."""
+        issues = []
+
         # Overall SMART status
         if not data.smart_status_passed:
             issues.append("SMART overall health: FAILED")
-        
+
         # Check critical attributes
         for attr_id, (key, name) in SMART_ATTRIBUTES.items():
             raw_value = data.get_attribute_raw_value(attr_id)
             threshold = config.smart_thresholds.get(key, 0)
-            
+
             if raw_value > threshold:
                 issues.append(f"{name}: {raw_value} > {threshold}")
-        
+
         # Temperature
         if data.temperature and data.temperature > config.temp_threshold:
             issues.append(f"Temperature: {data.temperature}°C > {config.temp_threshold}°C")
-        
+
         # Latest self-test (SKIP THIS CHECK IF A TEST IS CURRENTLY RUNNING)
         if not is_test_in_progress:
             latest_test = data.get_latest_self_test()
@@ -609,7 +654,7 @@ class SMARTHandler:
                 status = latest_test.get('status', {})
                 if not status.get('passed', True):
                     issues.append(f"Self-test failed: {status.get('string', 'Unknown')}")
-        
+
         return len(issues) == 0, issues
     
     def schedule_test(self, device_path: str, test_type: str) -> bool:
