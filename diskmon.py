@@ -757,7 +757,7 @@ class HealthChecker:
             
             if smart_status == SmartStatus.SUCCESS:
                 state.last_successful_smart_read_ts = time.time()
-                self._schedule_tests(config, state)
+                self._schedule_tests(config, state, smart_data)
 
         # Build final result
         is_healthy = len(issues) == 0
@@ -796,18 +796,28 @@ class HealthChecker:
         
         return " | ".join(parts)
     
-    def _schedule_tests(self, config: DiskmonConfig, state: DeviceState):
+    def _schedule_tests(self, config: DiskmonConfig, state: DeviceState, smart_data: SMARTData):
         """Schedule tests if due"""
         now = time.time()
         
-        # Short test
+        if smart_data.device_type == 'nvme':
+            logging.info("Skipping ATA/SATA self-test scheduling for NVMe device.")
+            # We can also update the timestamp here to prevent re-checking every time
+            # This signifies we've "handled" the schedule check for this interval.
+            if state.last_short_test_scheduled_ts is None:
+                state.last_short_test_scheduled_ts = now
+            if state.last_long_test_scheduled_ts is None:
+                state.last_long_test_scheduled_ts = now
+            return
+
+        # Short test (This code will now only run for non-NVMe drives)
         if self.state_manager.is_test_due(
             state.last_short_test_scheduled_ts,
             config.short_test_interval
         ):
             if self.smart_handler.schedule_test(config.device, 'short'):
                 state.last_short_test_scheduled_ts = now
-        
+
         # Long test
         if self.state_manager.is_test_due(
             state.last_long_test_scheduled_ts,
@@ -815,7 +825,7 @@ class HealthChecker:
         ):
             if self.smart_handler.schedule_test(config.device, 'long'):
                 state.last_long_test_scheduled_ts = now
-        
+
         # Badblocks (if enabled)
         if config.badblocks_interval and self.state_manager.is_test_due(
             state.last_badblocks_scheduled_ts,
