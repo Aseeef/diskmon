@@ -890,24 +890,36 @@ class BtrfsScrubHandler:
         return len(issues) == 0, issues
     
     def start_scrub(self, mount_path: str) -> bool:
-        """Start a btrfs scrub asynchronously (btrfs scrub start runs in background by default)"""
+        """Start a btrfs scrub in the background.
+        
+        Uses Popen to avoid blocking — the kernel runs the scrub
+        asynchronously and we only need to kick it off.
+        """
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 ['btrfs', 'scrub', 'start', mount_path],
-                capture_output=True, text=True, timeout=30
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True
             )
+            try:
+                stdout, stderr = proc.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                logging.info(f"btrfs scrub start still running after 60s, detaching (scrub continues in kernel)")
+                proc.stdout.close()
+                proc.stderr.close()
+                return True
             
-            if result.returncode == 0:
+            combined = (stdout.decode() + stderr.decode()).lower()
+            if proc.returncode == 0 or 'already running' in combined:
                 logging.info(f"Started btrfs scrub on {mount_path}")
                 return True
             
-            if 'already running' in result.stderr.lower() or 'already running' in result.stdout.lower():
-                logging.info(f"Btrfs scrub already running on {mount_path}")
-                return True
-            
-            logging.error(f"Failed to start btrfs scrub: {result.stderr}")
+            logging.error(f"Failed to start btrfs scrub (rc={proc.returncode}): {stderr.decode().strip()}")
             return False
             
+        except FileNotFoundError:
+            logging.error("btrfs command not found")
+            return False
         except Exception as e:
             logging.error(f"Error starting btrfs scrub: {e}")
             return False
