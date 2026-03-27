@@ -65,6 +65,15 @@ SMART_ATTRIBUTES = {
     198: ('uncorrectable', 'Offline_Uncorrectable'),
 }
 
+# Btrfs scrub error fields that are checked against thresholds
+BTRFS_SCRUB_ERROR_FIELDS = {
+    'read_errors': 'Read Errors',
+    'csum_errors': 'Checksum Errors',
+    'verify_errors': 'Verify Errors',
+    'super_errors': 'Superblock Errors',
+    'uncorrectable_errors': 'Uncorrectable Errors',
+}
+
 
 # ============================================================================
 # Data Classes
@@ -91,6 +100,7 @@ class DiskmonConfig:
     short_test_interval: int = 7
     long_test_interval: int = 30
     badblocks_interval: Optional[int] = None  # Off by default
+    btrfs_scrub_interval: int = 30  # days
     
     # Idle detection
     idle_threshold: int = 300  # seconds
@@ -102,6 +112,16 @@ class DiskmonConfig:
     output_format: OutputFormat = OutputFormat.HUMAN
     verbose: bool = False
     color_output: bool = True  # New: color support for human format
+    
+    # Btrfs mode
+    is_btrfs: bool = False
+    btrfs_scrub_thresholds: Dict[str, int] = field(default_factory=lambda: {
+        'read_errors': 0,
+        'csum_errors': 0,
+        'verify_errors': 0,
+        'super_errors': 0,
+        'uncorrectable_errors': 0,
+    })
 
 
 @dataclass
@@ -112,6 +132,7 @@ class DeviceState:
     last_short_test_scheduled_ts: Optional[float] = None
     last_long_test_scheduled_ts: Optional[float] = None
     last_badblocks_scheduled_ts: Optional[float] = None
+    last_btrfs_scrub_scheduled_ts: Optional[float] = None
     last_successful_smart_read_ts: Optional[float] = None
     last_io_ticks: Optional[int] = None
     
@@ -157,6 +178,27 @@ class HealthCheckResult:
     details: Dict[str, Any] = field(default_factory=dict)
 
 
+class BtrfsScrubStatus(Enum):
+    """Btrfs scrub operation status"""
+    FINISHED = auto()
+    RUNNING = auto()
+    ABORTED = auto()
+    NO_HISTORY = auto()
+    FAILED = auto()
+
+
+@dataclass
+class BtrfsScrubData:
+    """Parsed btrfs scrub status data"""
+    started: Optional[str] = None
+    status: Optional[str] = None
+    duration: Optional[str] = None
+    errors: Dict[str, int] = field(default_factory=dict)
+    data_bytes_scrubbed: int = 0
+    tree_bytes_scrubbed: int = 0
+    corrected_errors: int = 0
+
+
 # ============================================================================
 # Core Components
 # ============================================================================
@@ -185,10 +227,24 @@ class ConfigManager:
     
     def load(self) -> DiskmonConfig:
         """Load configuration with proper precedence"""
+        self._detect_mode()
         self._load_from_file()
         self._apply_cli_overrides()
         self._validate_config()
         return self.config
+    
+    def _detect_mode(self):
+        """Detect if the target is a btrfs mount path vs a block device.
+        
+        A directory path implies btrfs mode; the actual filesystem validation
+        happens when `btrfs scrub status` is called during the health check.
+        """
+        device_path = Path(self.config.device)
+        if not device_path.is_dir():
+            return
+        
+        self.config.is_btrfs = True
+        self.config.device = str(device_path.resolve())
     
     def _load_from_file(self):
         """Load configuration from file if it exists"""
@@ -213,6 +269,11 @@ class ConfigManager:
             if 'smart_thresholds' in parser:
                 section = parser['smart_thresholds']
                 self._load_smart_thresholds(section)
+            
+            # Load btrfs scrub thresholds
+            if 'btrfs_scrub_thresholds' in parser:
+                section = parser['btrfs_scrub_thresholds']
+                self._load_btrfs_scrub_thresholds(section)
                 
         except Exception as e:
             logging.warning(f"Error parsing config file {config_path}: {e}")
@@ -232,6 +293,9 @@ class ConfigManager:
         if 'badblocks_interval' in section:
             self.config.badblocks_interval = section.getint('badblocks_interval')
         
+        self.config.btrfs_scrub_interval = section.getint(
+            'btrfs_scrub_interval', self.config.btrfs_scrub_interval)
+        
         self.config.idle_threshold = section.getint(
             'idle_threshold', self.config.idle_threshold)
         self.config.max_idle_skip = section.getint(
@@ -244,6 +308,12 @@ class ConfigManager:
         for key in self.config.smart_thresholds:
             if key in section:
                 self.config.smart_thresholds[key] = section.getint(key)
+    
+    def _load_btrfs_scrub_thresholds(self, section):
+        """Load btrfs scrub error thresholds from config section"""
+        for key in self.config.btrfs_scrub_thresholds:
+            if key in section:
+                self.config.btrfs_scrub_thresholds[key] = section.getint(key)
     
     def _apply_cli_overrides(self):
         """Apply command-line argument overrides"""
@@ -258,6 +328,8 @@ class ConfigManager:
             self.config.long_test_interval = self.args.long_test_days
         if self.args.badblocks_days is not None:
             self.config.badblocks_interval = self.args.badblocks_days
+        if self.args.btrfs_scrub_days is not None:
+            self.config.btrfs_scrub_interval = self.args.btrfs_scrub_days
         if self.args.idle_threshold is not None:
             self.config.idle_threshold = self.args.idle_threshold
         if self.args.max_idle_skip is not None:
@@ -278,16 +350,20 @@ class ConfigManager:
             self._parse_smart_cli()
     
     def _parse_smart_cli(self):
-        """Parse SMART thresholds from CLI argument"""
+        """Parse error thresholds from CLI argument (SMART or btrfs scrub)"""
+        thresholds = (self.config.btrfs_scrub_thresholds
+                      if self.config.is_btrfs
+                      else self.config.smart_thresholds)
         try:
             for item in self.args.smart.split(','):
                 key, value = item.strip().split('=')
                 key = key.strip()
-                if key in self.config.smart_thresholds:
-                    self.config.smart_thresholds[key] = int(value.strip())
+                if key in thresholds:
+                    thresholds[key] = int(value.strip())
                 else:
-                    logging.warning(f"Unknown SMART threshold key: {key}")
-        except ValueError as e:
+                    valid_keys = ', '.join(thresholds.keys())
+                    logging.warning(f"Unknown threshold key: {key} (valid: {valid_keys})")
+        except ValueError:
             logging.error(f"Invalid --smart format: {self.args.smart}")
             sys.exit(1)
     
@@ -300,6 +376,27 @@ class ConfigManager:
         if self.config.temp_threshold < 0:
             logging.error("Temperature threshold must be positive")
             sys.exit(1)
+        
+        if self.config.is_btrfs:
+            unsupported = []
+            if self.args.temp_threshold is not None:
+                unsupported.append('--temp-threshold')
+            if self.args.short_test_days is not None:
+                unsupported.append('--short-test-days')
+            if self.args.long_test_days is not None:
+                unsupported.append('--long-test-days')
+            if self.args.idle_threshold is not None:
+                unsupported.append('--idle-threshold')
+            if self.args.max_idle_skip is not None:
+                unsupported.append('--max-idle-skip')
+            if self.args.badblocks_days is not None:
+                unsupported.append('--badblocks-days')
+            if unsupported:
+                print(f"ERROR: Options not supported for btrfs: {', '.join(unsupported)}", file=sys.stderr)
+                sys.exit(1)
+        elif self.args.btrfs_scrub_days is not None:
+            print("ERROR: --btrfs-scrub-days is only valid for btrfs mount paths", file=sys.stderr)
+            sys.exit(1)
     
     @staticmethod
     def get_cli_parser() -> argparse.ArgumentParser:
@@ -311,7 +408,7 @@ class ConfigManager:
         
         # Required arguments
         parser.add_argument('device', 
-                          help='Block device path (e.g., /dev/sda)')
+                          help='Block device (e.g., /dev/sda) or btrfs mount path (e.g., /media/backups)')
         parser.add_argument('--kuma-url', required=True,
                           help='Uptime Kuma push URL')
         
@@ -325,7 +422,8 @@ class ConfigManager:
         parser.add_argument('--temp-threshold', type=int,
                           help='Temperature threshold °C (default: 50)')
         parser.add_argument('--smart',
-                          help='SMART thresholds: "pending=N,realloc=N,..."')
+                          help='Error thresholds: SMART "pending=N,realloc=N,..." '
+                               'or btrfs "read_errors=N,csum_errors=N,..."')
         
         # Test scheduling
         parser.add_argument('--short-test-days', type=int,
@@ -334,6 +432,8 @@ class ConfigManager:
                           help='Days between long SMART tests (default: 30)')
         parser.add_argument('--badblocks-days', type=int,
                           help='Days between bad block scans (optional)')
+        parser.add_argument('--btrfs-scrub-days', type=int,
+                          help='Days between btrfs scrub runs (default: 30, btrfs only)')
         
         # Idle detection
         parser.add_argument('--idle-threshold', type=int,
@@ -363,7 +463,11 @@ class StateManager:
     """Manages persistent state with multi-process safety"""
     
     def __init__(self, device_path: str):
-        self.device_name = Path(device_path).name
+        path = Path(device_path)
+        if path.is_dir():
+            self.device_name = str(path.resolve()).strip('/').replace('/', '_')
+        else:
+            self.device_name = path.name
         self.state_dir = Path("/var/lib/diskmon/devices")
         self.state_dir.mkdir(parents=True, exist_ok=True)
         
@@ -469,6 +573,10 @@ class FilesystemMonitor:
     def get_usage(self, device_path: str) -> Optional[float]:
         """Get filesystem usage percentage"""
         try:
+            if Path(device_path).is_dir():
+                usage = psutil.disk_usage(device_path)
+                return usage.percent
+            
             # Check direct device mount
             for partition in psutil.disk_partitions(all=False):
                 if partition.device == device_path:
@@ -701,6 +809,110 @@ class SMARTHandler:
             return False
 
 
+class BtrfsScrubHandler:
+    """Handles btrfs scrub operations and evaluation"""
+    
+    def get_status(self, mount_path: str) -> Tuple[BtrfsScrubStatus, Optional[BtrfsScrubData]]:
+        """Get btrfs scrub status for a mount path"""
+        try:
+            result = subprocess.run(
+                ['btrfs', 'scrub', 'status', '-R', mount_path],
+                capture_output=True, text=True, timeout=30
+            )
+            
+            combined = result.stdout + result.stderr
+            if 'no stats available' in combined.lower():
+                return BtrfsScrubStatus.NO_HISTORY, None
+            
+            if result.returncode != 0:
+                logging.error(f"btrfs scrub status failed (rc={result.returncode}): {result.stderr}")
+                return BtrfsScrubStatus.FAILED, None
+            
+            return self._parse_status(result.stdout)
+            
+        except subprocess.TimeoutExpired:
+            logging.error("btrfs scrub status timed out")
+            return BtrfsScrubStatus.FAILED, None
+        except FileNotFoundError:
+            logging.error("btrfs command not found")
+            return BtrfsScrubStatus.FAILED, None
+    
+    def _parse_status(self, output: str) -> Tuple[BtrfsScrubStatus, Optional[BtrfsScrubData]]:
+        """Parse btrfs scrub status -R output"""
+        data = BtrfsScrubData()
+        
+        for line in output.splitlines():
+            line = line.strip()
+            if not line or ':' not in line:
+                continue
+            
+            key, _, value = line.partition(':')
+            key = key.strip().lower()
+            value = value.strip()
+            
+            if key == 'scrub started':
+                data.started = value
+            elif key == 'status':
+                data.status = value.lower()
+            elif key == 'duration':
+                data.duration = value
+            elif key == 'data_bytes_scrubbed':
+                data.data_bytes_scrubbed = int(value)
+            elif key == 'tree_bytes_scrubbed':
+                data.tree_bytes_scrubbed = int(value)
+            elif key == 'corrected_errors':
+                data.corrected_errors = int(value)
+            elif key in BTRFS_SCRUB_ERROR_FIELDS:
+                data.errors[key] = int(value)
+        
+        if data.status is None:
+            logging.error("Could not parse scrub status from btrfs output")
+            return BtrfsScrubStatus.FAILED, None
+        
+        status_map = {
+            'finished': BtrfsScrubStatus.FINISHED,
+            'running': BtrfsScrubStatus.RUNNING,
+            'aborted': BtrfsScrubStatus.ABORTED,
+        }
+        scrub_status = status_map.get(data.status, BtrfsScrubStatus.FAILED)
+        return scrub_status, data
+    
+    def evaluate(self, data: BtrfsScrubData, config: DiskmonConfig) -> Tuple[bool, List[str]]:
+        """Evaluate btrfs scrub data against thresholds"""
+        issues = []
+        
+        for field_name, display_name in BTRFS_SCRUB_ERROR_FIELDS.items():
+            count = data.errors.get(field_name, 0)
+            threshold = config.btrfs_scrub_thresholds.get(field_name, 0)
+            if count > threshold:
+                issues.append(f"{display_name}: {count} > {threshold}")
+        
+        return len(issues) == 0, issues
+    
+    def start_scrub(self, mount_path: str) -> bool:
+        """Start a btrfs scrub asynchronously (btrfs scrub start runs in background by default)"""
+        try:
+            result = subprocess.run(
+                ['btrfs', 'scrub', 'start', mount_path],
+                capture_output=True, text=True, timeout=30
+            )
+            
+            if result.returncode == 0:
+                logging.info(f"Started btrfs scrub on {mount_path}")
+                return True
+            
+            if 'already running' in result.stderr.lower() or 'already running' in result.stdout.lower():
+                logging.info(f"Btrfs scrub already running on {mount_path}")
+                return True
+            
+            logging.error(f"Failed to start btrfs scrub: {result.stderr}")
+            return False
+            
+        except Exception as e:
+            logging.error(f"Error starting btrfs scrub: {e}")
+            return False
+
+
 class HealthChecker:
     """Coordinates health checks"""
     
@@ -709,10 +921,19 @@ class HealthChecker:
         self.device_manager = DeviceManager()
         self.fs_monitor = FilesystemMonitor()
         self.smart_handler = SMARTHandler()
+        self.btrfs_handler = BtrfsScrubHandler()
         
     def check(self, config: DiskmonConfig, state: DeviceState) -> HealthCheckResult:
-        """Perform complete health check with fully robust 'test in progress' logic."""
+        """Perform complete health check, dispatching to btrfs or SMART path."""
         start_time = time.time()
+        
+        if config.is_btrfs:
+            return self._check_btrfs(config, state, start_time)
+        
+        return self._check_block_device(config, state, start_time)
+    
+    def _check_block_device(self, config: DiskmonConfig, state: DeviceState, start_time: float) -> HealthCheckResult:
+        """Health check for block devices using SMART."""
         issues = []
         details = {}
 
@@ -795,6 +1016,99 @@ class HealthChecker:
             parts.append(f"Temp: {temp}°C")
         
         return " | ".join(parts)
+    
+    def _check_btrfs(self, config: DiskmonConfig, state: DeviceState, start_time: float) -> HealthCheckResult:
+        """Health check for btrfs mount paths using scrub data."""
+        issues = []
+        details = {}
+        
+        if not Path(config.device).is_dir():
+            return self._result(False, "Btrfs mount path not found", start_time, details)
+        
+        usage = self.fs_monitor.get_usage(config.device)
+        if usage is not None:
+            details['usage_percent'] = usage
+            if usage > config.usage_threshold:
+                issues.append(f"Disk usage: {usage:.1f}% > {config.usage_threshold}%")
+        
+        scrub_status, scrub_data = self.btrfs_handler.get_status(config.device)
+        details['btrfs_scrub_status'] = scrub_status.name.lower()
+        
+        if scrub_status == BtrfsScrubStatus.FAILED:
+            issues.append("Failed to get btrfs scrub status")
+        
+        elif scrub_status == BtrfsScrubStatus.NO_HISTORY:
+            details['btrfs_scrub_status'] = 'no_history'
+        
+        elif scrub_data:
+            if scrub_data.started:
+                details['btrfs_scrub_started'] = scrub_data.started
+            if scrub_data.duration:
+                details['btrfs_scrub_duration'] = scrub_data.duration
+            if scrub_data.data_bytes_scrubbed:
+                details['btrfs_data_scrubbed_gb'] = round(scrub_data.data_bytes_scrubbed / (1024**3), 1)
+            if scrub_data.corrected_errors:
+                details['btrfs_corrected_errors'] = scrub_data.corrected_errors
+            
+            is_ok, scrub_issues = self.btrfs_handler.evaluate(scrub_data, config)
+            issues.extend(scrub_issues)
+            
+            if scrub_status == BtrfsScrubStatus.ABORTED:
+                issues.append("Last btrfs scrub was aborted")
+        
+        if scrub_status not in (BtrfsScrubStatus.RUNNING, BtrfsScrubStatus.FAILED):
+            self._schedule_btrfs_scrub(config, state)
+        
+        is_healthy = len(issues) == 0
+        
+        if not is_healthy and scrub_status == BtrfsScrubStatus.RUNNING:
+            message = f"(Scrub Running) {'; '.join(issues)}"
+        elif not is_healthy:
+            message = "; ".join(issues)
+        else:
+            message = self._build_btrfs_success_message(details, scrub_status)
+        
+        state.last_known_healthy = is_healthy
+        state.last_known_message = message
+        state.total_checks += 1
+        if not is_healthy:
+            state.consecutive_failures += 1
+            state.total_failures += 1
+        else:
+            state.consecutive_failures = 0
+        
+        return self._result(is_healthy, message, start_time, details)
+    
+    def _build_btrfs_success_message(self, details: Dict[str, Any], scrub_status: BtrfsScrubStatus) -> str:
+        """Build success message for btrfs checks."""
+        if scrub_status == BtrfsScrubStatus.RUNNING:
+            status_text = "OK (Scrub Running)"
+        elif scrub_status == BtrfsScrubStatus.NO_HISTORY:
+            status_text = "OK (No Scrub History)"
+        else:
+            status_text = "OK"
+        
+        parts = [status_text]
+        usage = details.get('usage_percent')
+        if usage is not None:
+            parts.append(f"Usage: {usage:.1f}%")
+        
+        scrub_started = details.get('btrfs_scrub_started')
+        if scrub_started:
+            parts.append(f"Last Scrub: {scrub_started}")
+        
+        return " | ".join(parts)
+    
+    def _schedule_btrfs_scrub(self, config: DiskmonConfig, state: DeviceState):
+        """Schedule a btrfs scrub if due"""
+        if not self.state_manager.is_test_due(
+            state.last_btrfs_scrub_scheduled_ts,
+            config.btrfs_scrub_interval
+        ):
+            return
+        
+        if self.btrfs_handler.start_scrub(config.device):
+            state.last_btrfs_scrub_scheduled_ts = time.time()
     
     def _schedule_tests(self, config: DiskmonConfig, state: DeviceState, smart_data: SMARTData):
         """Schedule tests if due"""
